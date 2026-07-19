@@ -1,0 +1,13 @@
+# Copy to ${XDG_CONFIG_HOME:-~/.config}/cxto/config.yaml.
+# Keep credentials in separate local files; do not commit them.
+codex_config_path: "~/.codex/config.toml"
+codex_auth_path: "~/.codex/auth.json"
+
+providers:
+  primary:
+    model: "gpt-5.5"
+    reasoning_effort: "high"
+    base_url: "https://provider.example/v1"
+    wire_api: "responses"
+    requires_openai_auth: true
+    auth_token_path: "~/.config/cxto/keys/primary.key"
