@@ -26,11 +26,12 @@ class CxtoCliTest(unittest.TestCase):
         )
         (self.home / ".codex" / "auth.json").write_text('{"OPENAI_API_KEY":"old"}\n', encoding="utf-8")
         (self.home / ".cxto.local.yaml").write_text(
-            'providers:\n  alpha:\n    model: "gpt-alpha"\n    reasoning_effort: "high"\n    base_url: "https://alpha.invalid/v1"\n    wire_api: "responses"\n    requires_openai_auth: true\n    auth_token_path: "~/.cxto/keys/alpha.key"\n  beta:\n    model: "gpt-beta"\n    reasoning_effort: "xhigh"\n    base_url: "https://beta.invalid/v1"\n    wire_api: "responses"\n    requires_openai_auth: true\n    auth_token_path: "~/.cxto/keys/beta.key"\n',
+            'providers:\n  alpha:\n    model: "gpt-alpha"\n    reasoning_effort: "high"\n    base_url: "https://alpha.invalid/v1"\n    wire_api: "responses"\n    requires_openai_auth: true\n    auth_token_path: "~/.cxto/keys/alpha.key"\n  beta:\n    model: "gpt-beta"\n    reasoning_effort: "xhigh"\n    base_url: "https://beta.invalid/v1"\n    wire_api: "responses"\n    requires_openai_auth: true\n    auth_token_path: "~/.cxto/keys/beta.key"\n  deepseek:\n    model: "deepseek-v4-flash"\n    reasoning_effort: "high"\n    base_url: "https://api.deepseek.com/"\n    wire_api: "responses"\n    preferred_auth_method: "apikey"\n    forced_login_method: "api"\n    model_catalog_json: "~/.codex/models.json"\n    auth_token_path: "~/.cxto/keys/deepseek.key"\n',
             encoding="utf-8",
         )
         (self.home / ".cxto" / "keys" / "alpha.key").write_text("alpha-key\n", encoding="utf-8")
         (self.home / ".cxto" / "keys" / "beta.key").write_text("beta-key\n", encoding="utf-8")
+        (self.home / ".cxto" / "keys" / "deepseek.key").write_text("sk-deepseek-test\n", encoding="utf-8")
         self.env = os.environ | {"HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / ".config")}
 
     def tearDown(self) -> None:
@@ -81,6 +82,37 @@ class CxtoCliTest(unittest.TestCase):
         arguments = capture.read_text(encoding="utf-8")
         self.assertIn("model_providers.legacy.base_url=\"https://beta.invalid/v1\"", arguments)
         self.assertIn(SESSION_ID, arguments)
+
+    def test_use_deepseek_writes_bearer_token_and_extra_top_keys(self) -> None:
+        result = self.run_cli("use", "deepseek")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = (self.home / ".codex" / "config.toml").read_text(encoding="utf-8")
+        self.assertIn('model_provider = "cxto_active"', config)
+        self.assertIn('model = "deepseek-v4-flash"', config)
+        self.assertIn('preferred_auth_method = "apikey"', config)
+        self.assertIn('forced_login_method = "api"', config)
+        self.assertIn('model_catalog_json = "~/.codex/models.json"', config)
+        # provider 块写入了 experimental_bearer_token，且不再有 requires_openai_auth
+        active_block = config.split("[model_providers.cxto_active]")[1]
+        self.assertIn('experimental_bearer_token = "sk-deepseek-test"', active_block)
+        self.assertNotIn("requires_openai_auth", active_block)
+        # models.json 被写入
+        self.assertTrue((self.home / ".codex" / "models.json").exists())
+        catalog = json.loads((self.home / ".codex" / "models.json").read_text(encoding="utf-8"))
+        self.assertIn("deepseek-v4-flash", [m["slug"] for m in catalog["models"]])
+
+    def test_switch_away_from_deepseek_cleans_extra_top_keys(self) -> None:
+        self.run_cli("use", "deepseek")
+        result = self.run_cli("use", "beta")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = (self.home / ".codex" / "config.toml").read_text(encoding="utf-8")
+        # deepseek 的顶层额外键被清理
+        self.assertNotIn("preferred_auth_method", config)
+        self.assertNotIn("forced_login_method", config)
+        self.assertNotIn("model_catalog_json", config)
+        # provider 块的 experimental_bearer_token 残留被清理
+        self.assertNotIn("experimental_bearer_token", config)
+        self.assertIn('requires_openai_auth = true', config)
 
 
 if __name__ == "__main__":

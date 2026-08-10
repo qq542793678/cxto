@@ -69,6 +69,18 @@ providers:
     wire_api: "responses"
     requires_openai_auth: true
     auth_token_path: "~/.config/cxto/keys/channel_b.key"
+
+  # DeepSeek 官方接入 Codex（原生 Responses API）
+  # 官方文档: https://api-docs.deepseek.com/zh-cn/quick_start/agent_integrations/codex
+  deepseek:
+    model: "deepseek-v4-flash"
+    reasoning_effort: "high"
+    base_url: "https://api.deepseek.com/"
+    wire_api: "responses"
+    preferred_auth_method: "apikey"
+    forced_login_method: "api"
+    model_catalog_json: "~/.codex/models.json"
+    auth_token_path: "~/.config/cxto/keys/deepseek.key"
 ```
 
 每个 key 文件只有一行对应渠道的 API key：
@@ -77,6 +89,8 @@ providers:
 printf '%s\n' 'YOUR_API_KEY' > ~/.config/cxto/keys/channel_a.key
 chmod 600 ~/.config/cxto/keys/channel_a.key
 ```
+
+切换到 DeepSeek 渠道后，cxto 会自动把内置的 DeepSeek 模型目录写入 `model_catalog_json` 指定路径（`~/.codex/models.json`），并把 key 文件中的 token 写入 config.toml 的 `experimental_bearer_token` 字段；切回普通渠道时会自动清理这些 DeepSeek 特有字段。注意目前 DeepSeek 仅 `deepseek-v4-flash` 支持接入 Codex（`deepseek-v4-pro` 预计 2026 年 8 月初支持）。
 
 不要将 `keys/`、`auth.json` 或真实的 `config.yaml` 提交到 Git。
 
@@ -181,11 +195,17 @@ cxto init --print
 | `reasoning_effort` | 可选，推理强度：`low`、`medium`、`high`、`xhigh`。 |
 | `wire_api` | 通常填写 `responses`。 |
 | `requires_openai_auth` | 通常填写 `true`。 |
+| `preferred_auth_method` | 可选（DeepSeek 等非标准渠道用）。设为 `apikey` 时，切换会改用 `experimental_bearer_token` 认证，并把 key 文件中的 token 写入 config.toml。 |
+| `forced_login_method` | 可选，配合 `preferred_auth_method` 使用；DeepSeek 场景填 `api`。 |
+| `model_catalog_json` | 可选，指向 Codex 模型目录 JSON 路径；切换时自动写入内置的 DeepSeek 模型元数据。 |
+| `experimental_bearer_token` | 由 cxto 自动注入，无需在 YAML 中手写；密钥统一放 `auth_token_path` 的 key 文件。 |
 
 ## 安全与行为
 
 - `cxto use` 会先备份，再更新 `~/.codex/config.toml` 与 `~/.codex/auth.json`。
 - API key 只从本地 key 文件读取，不会显示在 `status` 输出中。
+- DeepSeek 渠道：token 通过 `experimental_bearer_token` 直接写入 config.toml，本地 key 文件权限请保持 `600`；`auth.json` 仍写入占位 `OPENAI_API_KEY`（Codex 客户端校验需要）。
+- 切换非 DeepSeek 渠道时会自动清理 `preferred_auth_method` / `forced_login_method` / `model_catalog_json` / `experimental_bearer_token` 等 DeepSeek 特有字段。
 - 已启动的 Codex 进程不会被强制重启；切换后重新启动或恢复会话即可。
 - `cxto` 不修改会话 rollout 文件。
 
