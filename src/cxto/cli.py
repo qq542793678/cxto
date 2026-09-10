@@ -62,8 +62,8 @@ DEEPSEEK_MODELS_JSON = r'''{
       "comp_hash": "3000",
       "reasoning_summary_format": "experimental",
       "default_reasoning_summary": "none",
-      "display_name": "DeepSeek-V4-Flash",
-      "description": "Latest frontier agentic coding model.",
+      "display_name": "DeepSeek-V4.1-Flash",
+      "description": "Latest frontier agentic coding model. Upstream resolves this slug to deepseek-flash.",
       "default_reasoning_level": "high",
       "supported_reasoning_levels": [
         {
