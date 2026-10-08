@@ -172,6 +172,33 @@ DEEPSEEK_MODELS_JSON = r'''{
 }'''
 
 
+# 一些第三方网关用带命名空间前缀的 slug 指向同一个上游模型（例如腾讯 tokenhub 的
+# deepseek/deepseek-flash 就是 deepseek-flash）。官方 models.json 里没有这些 slug，
+# codex 查不到元数据就退回 fallback（实测上下文窗口从 1M 掉到约 258k，长会话会提前
+# 触发自动压缩）。这里按别名从基准条目派生一条，字段全部照抄基准条目，只改写
+# slug / display_name / description —— 既不用在源码里重复两份 ~30KB 的提示词，
+# 也不会在基准条目更新后产生漂移。
+DEEPSEEK_MODEL_ALIASES = {
+    "deepseek/deepseek-flash": ("deepseek-v4-flash", "DeepSeek-Flash (Tencent tokenhub)"),
+}
+
+
+def models_catalog_json(model: str | None = None) -> str:
+    """内置模型目录内容；model 命中别名表时补上对应的别名条目。"""
+    catalog = json.loads(DEEPSEEK_MODELS_JSON)
+    entries = {item.get("slug"): item for item in catalog.get("models", [])}
+    for alias, (base_slug, display_name) in DEEPSEEK_MODEL_ALIASES.items():
+        base = entries.get(base_slug)
+        if base is None or alias in entries or model not in (None, alias):
+            continue
+        entry = json.loads(json.dumps(base))  # 深拷贝，避免污染基准条目
+        entry["slug"] = alias
+        entry["display_name"] = display_name
+        entry["description"] = f"{display_name}；上游同一模型 {base_slug} 的网关别名。"
+        catalog["models"].append(entry)
+    return json.dumps(catalog, ensure_ascii=False, indent=2)
+
+
 def home() -> Path:
     return Path.home()
 
@@ -509,11 +536,15 @@ def provider_or_exit(state: dict[str, Any], name: str) -> dict[str, Any]:
     return provider
 
 
-def write_models_json(target: Path) -> Path | None:
-    """将内置的 DeepSeek models.json 写入目标路径；已存在则先备份。"""
+def write_models_json(target: Path, model: str | None = None) -> Path | None:
+    """将内置的 DeepSeek models.json 写入目标路径；已存在则先备份。
+
+    model 命中 DEEPSEEK_MODEL_ALIASES 时，对应的别名条目一并写入，让网关侧
+    的 slug 也能拿到同一份元数据。
+    """
     target.parent.mkdir(parents=True, exist_ok=True)
     backup_path = backup(target) if target.exists() else None
-    target.write_text(DEEPSEEK_MODELS_JSON + "\n", encoding="utf-8")
+    target.write_text(models_catalog_json(model) + "\n", encoding="utf-8")
     return backup_path
 
 
@@ -536,7 +567,7 @@ def activate(state: dict[str, Any], name: str, model_override: str | None = None
     models_backup = None
     catalog = provider.get("model_catalog_json")
     if catalog:
-        models_backup = write_models_json(expand_path(catalog))
+        models_backup = write_models_json(expand_path(catalog), model)
     return {"provider": provider, "model": model, "effort": effort, "config_backup": config_backup, "auth_backup": auth_backup, "models_backup": models_backup, "state": write_active_provider(state, name)}
 
 
