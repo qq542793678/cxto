@@ -11,24 +11,48 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import glob
+import hashlib
 import json
 import os
 import re
 import shlex
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
+if __package__:
+    from . import launcher
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import launcher
 
-VERSION = "0.2.0"
+VERSION = "0.4.0"
 ACTIVE_PROVIDER = "cxto_active"
-TOP_LEVEL_KEYS = {"model_provider", "model", "review_model", "model_reasoning_effort"}
+TOP_LEVEL_KEYS = {"model_provider", "model", "review_model", "model_reasoning_effort", "model_catalog_json"}
 PROVIDER_KEYS = {"name", "base_url", "wire_api", "requires_openai_auth"}
-# 顶层额外键：某些 provider（如 deepseek）需要在 config.toml top-level 写的字段，
-# 切到的 provider 配置了这些字段时写入，切走时清理。
-DEEPSEEK_EXTRA_TOP_KEYS = {"preferred_auth_method", "forced_login_method", "model_catalog_json"}
+# 顶层额外键：provider 专属认证设置，以及 cxto 管理的联合模型目录路径。
+CHANNEL_EXTRA_TOP_KEYS = {"preferred_auth_method", "forced_login_method", "model_catalog_json"}
 # provider 块额外支持的键；experimental_bearer_token 由 activate 从 key 文件动态注入。
 EXTRA_PROVIDER_KEYS = {"experimental_bearer_token", "env_key"}
+# 每个渠道在 config.toml 里有一个专属的 provider 块，块名是 "cxto_<渠道>"。顶层
+# model_provider 指向它，会话就把这个名字钉进自己的 session_meta；之后切别的渠道只重写
+# 顶层那一行，其余块一个字节都不动，所以已经在跑的会话不会被切换带跑。
+#
+# 为什么不能像以前那样只用一个共享块：Codex 的常驻 app-server daemon 每个 turn 都会重新
+# 解析「会话钉住的那个 provider 名字」在当前 config.toml 里的定义。所有会话钉同一个可变块
+# ⇒ 一 `cxto use` 就全体改道（地址和 key 一起变），别的会话直接报模型找不到。
+CODEX_PROVIDER_PREFIX = "cxto_"
+# ACTIVE_PROVIDER 是升级前的遗留别名：老会话的 session_meta 里钉的是它，区块若消失就解析不到。
+# 保留它、每次切换同步指向当前渠道，纯粹是为了这些老会话不至于报错；新会话一律走 cxto_<渠道>。
+LEGACY_ACTIVE_CHANNEL = "active"
+# 常驻 daemon 只在启动时读取模型目录。只要 Codex 原生目录可用，cxto 就把它与渠道自定义
+# 模型合成一个固定目录；普通渠道切换不再改变 daemon 缓存的目录。
+DAEMON_PID_DIR = "app-server-daemon"
+DAEMON_PID_NAME = "daemon.pid"
+CODEX_COMMAND = "codex"
+RESUME_TOKEN_ENV = "CXTO_RESUME_API_KEY"
 
 # DeepSeek 官方提供的 Codex 模型目录（models.json），声明 deepseek-v4-flash/v4-pro 的
 # 上下文窗口、推理档位、工具调用格式等元数据。内容取自官方接入脚本，勿随意修改。
@@ -320,7 +344,7 @@ def parse_codex_top(path: Path) -> dict[str, Any]:
         if line.lstrip().startswith("["):
             break
         match = re.match(r"^\s*([A-Za-z0-9_]+)\s*=\s*(.+?)\s*$", line)
-        if match and match.group(1) in TOP_LEVEL_KEYS:
+        if match and match.group(1) in TOP_LEVEL_KEYS | CHANNEL_EXTRA_TOP_KEYS:
             values[match.group(1)] = parse_scalar(match.group(2))
     return values
 
@@ -339,7 +363,7 @@ def parse_codex_providers(path: Path) -> dict[str, dict[str, Any]]:
             current = None
         elif current:
             match = re.match(r"^\s*([A-Za-z0-9_]+)\s*=\s*(.+?)\s*$", line)
-            if match and match.group(1) in PROVIDER_KEYS:
+            if match and match.group(1) in PROVIDER_KEYS | EXTRA_PROVIDER_KEYS:
                 providers[current][match.group(1)] = parse_scalar(match.group(2))
     return providers
 
@@ -382,28 +406,58 @@ def active_path(state: dict[str, Any]) -> Path:
     return expand_path(state["top"].get("cxto_active_state_path")) or default_active_state()
 
 
-def active_provider(state: dict[str, Any]) -> str | None:
+def read_active_state(state: dict[str, Any]) -> dict[str, Any]:
     path = active_path(state)
     try:
-        value = json.loads(read_text(path)).get("provider") if path.exists() else None
+        return json.loads(read_text(path)) if path.exists() else {}
     except json.JSONDecodeError:
-        value = None
+        return {}
+
+
+def active_provider(state: dict[str, Any]) -> str | None:
+    value = read_active_state(state).get("provider")
     return str(value) if value else None
 
 
-def write_active_provider(state: dict[str, Any], provider: str) -> Path:
+def active_catalog(state: dict[str, Any]) -> str | None:
+    """daemon 已加载的模型目录签名；用来判断内存缓存是不是已经过期。"""
+    value = read_active_state(state).get("catalog")
+    return str(value) if value else None
+
+
+def write_active_provider(state: dict[str, Any], provider: str, catalog: str | None = None) -> Path:
     path = active_path(state)
     path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"provider": provider, "catalog": catalog, "updated_at": dt.datetime.now(dt.timezone.utc).isoformat()}
     temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(json.dumps({"provider": provider, "updated_at": dt.datetime.now(dt.timezone.utc).isoformat()}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     temporary.replace(path)
     return path
 
 
+def codex_provider_name(channel: str) -> str:
+    """渠道名 → 它在 config.toml 里的专属 provider 块名（稳定且唯一）。"""
+    return f"{CODEX_PROVIDER_PREFIX}{channel}"
+
+
+def channel_from_codex_provider(name: Any) -> str | None:
+    """provider 块名 → 渠道名；遗留的 cxto_active 和普通 provider 名都返回 None。"""
+    text = str(name or "")
+    if not text.startswith(CODEX_PROVIDER_PREFIX):
+        return None
+    channel = text[len(CODEX_PROVIDER_PREFIX):]
+    return None if not channel or channel == LEGACY_ACTIVE_CHANNEL else channel
+
+
 def resolved_current_provider(state: dict[str, Any]) -> str | None:
     configured = parse_codex_top(state["config"]).get("model_provider")
-    if configured != ACTIVE_PROVIDER:
-        return str(configured) if configured else None
+    if configured:
+        channel = channel_from_codex_provider(configured)
+        if channel:
+            return channel
+        if configured != ACTIVE_PROVIDER:
+            return str(configured)
+    # 遗留：顶层还停在 cxto_active 时，真正的渠道记在 active.json
     provider = active_provider(state)
     return provider if provider in state["providers"] else None
 
@@ -461,7 +515,7 @@ def replace_provider(lines: list[str], name: str, provider: dict[str, Any]) -> N
     if block is None:
         if lines and lines[-1].strip():
             lines.append("\n")
-        lines.append(f"[model_providers.{name}]\n")
+        lines.append(f"[model_providers.{config_key(name)}]\n")
         lines.extend(f"{key} = {quote_toml(values[key])}\n" for key in order if key in values)
         return
     start, end = block
@@ -485,22 +539,42 @@ def replace_provider(lines: list[str], name: str, provider: dict[str, Any]) -> N
             end += 1
 
 
-def write_codex_config(state: dict[str, Any], provider: dict[str, Any], model: str, effort: str | None) -> Path:
+def write_codex_config(state: dict[str, Any], provider: dict[str, Any], model: str, effort: str | None, codex_name: str) -> Path:
     path: Path = state["config"]
     if not path.exists():
         raise SystemExit(f"Codex配置不存在: {path}")
     lines = read_text(path).splitlines(keepends=True)
-    replace_top(lines, "model_provider", ACTIVE_PROVIDER)
+    # 只动顶层 model_provider 那一行 + 当前渠道自己的块；别的渠道块一个字节不碰，
+    # 这样跑着的会话（它们各自钉着自己的块名）不会被这次切换带跑。
+    replace_top(lines, "model_provider", codex_name)
     replace_top(lines, "model", model)
     if effort:
         replace_top(lines, "model_reasoning_effort", effort)
-    for key in DEEPSEEK_EXTRA_TOP_KEYS:
+    for key in CHANNEL_EXTRA_TOP_KEYS:
         if key in provider:
             replace_top(lines, key, provider[key])
-    remove_top(lines, {k for k in DEEPSEEK_EXTRA_TOP_KEYS if k not in provider})
-    replace_provider(lines, ACTIVE_PROVIDER, provider)
+    remove_top(lines, {k for k in CHANNEL_EXTRA_TOP_KEYS if k not in provider})
+    replace_provider(lines, codex_name, provider)
+    # 遗留别名：升级前启动、session_meta 里钉着 cxto_active 的老会话仍按这个名字解析，
+    # 把它同步成当前渠道，否则它们会解析到过期的地址与凭证。
+    if codex_name != ACTIVE_PROVIDER:
+        replace_provider(lines, ACTIVE_PROVIDER, provider)
     backup_path = backup(path)
-    path.write_text("".join(lines), encoding="utf-8")
+    launcher.atomic_write(path, "".join(lines))
+    return backup_path
+
+
+def write_model_catalog_config(state: dict[str, Any], catalog: Path) -> Path | None:
+    path: Path = state["config"]
+    if not path.exists():
+        raise SystemExit(f"Codex配置不存在: {path}")
+    current = expand_path(parse_codex_top(path).get("model_catalog_json"))
+    if current and current.resolve() == catalog.resolve():
+        return None
+    lines = read_text(path).splitlines(keepends=True)
+    replace_top(lines, "model_catalog_json", str(catalog))
+    backup_path = backup(path)
+    launcher.atomic_write(path, "".join(lines))
     return backup_path
 
 
@@ -525,7 +599,7 @@ def write_auth(auth: Path, token: str) -> Path | None:
     except json.JSONDecodeError:
         payload = {}
     payload["OPENAI_API_KEY"] = token
-    auth.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    launcher.atomic_write(auth, json.dumps(payload, ensure_ascii=False, indent=2) + "\n", 0o600)
     return backup_path
 
 
@@ -543,44 +617,256 @@ def write_models_json(target: Path, model: str | None = None) -> Path | None:
     的 slug 也能拿到同一份元数据。
     """
     target.parent.mkdir(parents=True, exist_ok=True)
+    rendered = models_catalog_json(model) + "\n"
+    if target.exists() and read_text(target) == rendered:
+        return None
     backup_path = backup(target) if target.exists() else None
-    target.write_text(models_catalog_json(model) + "\n", encoding="utf-8")
+    target.write_text(rendered, encoding="utf-8")
     return backup_path
 
 
-def activate(state: dict[str, Any], name: str, model_override: str | None = None, effort_override: str | None = None, write_key: bool = True) -> dict[str, Any]:
-    provider = dict(provider_or_exit(state, name))
-    current = parse_codex_top(state["config"])
-    model = str(model_override or provider.get("model") or current.get("model") or "gpt-5.5")
-    effort = effort_override or provider.get("reasoning_effort") or current.get("model_reasoning_effort")
-    # 非标准 OpenAI 渠道（如 deepseek）用 experimental_bearer_token 认证：
-    # 从 key 文件读出的 token 注入 provider 块，直接写在 config.toml 里。
-    if write_key and "preferred_auth_method" in provider:
+def provider_with_token(state: dict[str, Any], provider: dict[str, Any], write_key: bool = True) -> dict[str, Any]:
+    """把渠道自己的 key 钉进它的 provider 块。
+
+    默认（`requires_openai_auth` 那类渠道）codex 会去读**全局**的 `auth.json` —— 那是所有
+    会话共用的一个文件，切渠道就会把它覆盖掉，于是别的会话拿着「自己的地址 + 别人的 key」
+    去请求，报 `401 INVALID_API_KEY`（实测踩过：老会话打 fufuapi 却 401）。好在块里同时有
+    `experimental_bearer_token` 和 `requires_openai_auth` 时**块里的 token 优先**（实测），
+    所以只要渠道配了独立 key 文件，就把 token 写进它的块 —— 每个会话自给自足，不再依赖
+    auth.json。没配 key 文件的渠道（token 只可能来自公共 auth.json）原样返回。
+    """
+    provider = dict(provider)
+    if write_key:
         token_path = expand_path(provider.get("auth_token_path"))
         if token_path and token_path.exists():
             provider["experimental_bearer_token"] = read_text(token_path).strip()
-    config_backup = write_codex_config(state, provider, model, str(effort) if effort else None)
+    return provider
+
+
+def catalog_signature(provider: dict[str, Any]) -> str:
+    """当前 config.toml 实际指向的模型目录签名。
+
+    daemon 启动时把 `model_catalog_json` 指的文件内容读进内存、之后一直不重读，所以
+    只有目录签名变化时才需要重启 daemon。使用联合目录时，普通渠道切换的签名保持不变。
+    未配置自定义目录时，Codex 内置目录记作 builtin。
+    """
+    path = expand_path(provider.get("model_catalog_json"))
+    if path is None or not path.exists():
+        return "builtin"
+    return f"{path}:{hashlib.sha256(path.read_bytes()).hexdigest()}"
+
+
+def native_model_catalog_path(state: dict[str, Any]) -> Path:
+    return expand_path(state["top"].get("model_catalog_path")) or state["config"].parent / "model_catalog.json"
+
+
+def combined_model_catalog_path(state: dict[str, Any]) -> Path:
+    return state["config"].parent / "cxto_model_catalog.json"
+
+
+def read_model_catalog(path: Path) -> dict[str, Any] | None:
+    try:
+        catalog = json.loads(read_text(path))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return catalog if isinstance(catalog, dict) and isinstance(catalog.get("models"), list) else None
+
+
+def codex_bundled_model_catalog(command: str = CODEX_COMMAND) -> dict[str, Any] | None:
+    """Read the model catalog shipped with the installed Codex CLI, without network access."""
+    try:
+        completed = subprocess.run(
+            [command, "debug", "models", "--bundled"],
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            encoding="utf-8",
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    try:
+        catalog = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return None
+    return catalog if isinstance(catalog, dict) and isinstance(catalog.get("models"), list) else None
+
+
+def native_model_catalog(state: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    """Prefer Codex's installed catalog and retain extra entries from the configured local catalog."""
+    local_path = expand_path(state["top"].get("model_catalog_path")) or native_model_catalog_path(state)
+    local = read_model_catalog(local_path)
+    bundled = codex_bundled_model_catalog()
+    if bundled is None:
+        return local, str(local_path)
+    if local is None:
+        return bundled, "Codex CLI 内置目录"
+
+    # Prefer the metadata shipped with the installed CLI. Preserve older/local-only entries
+    # that may still be exposed by a configured provider gateway.
+    entries: dict[str, dict[str, Any]] = {}
+    for source in (bundled, local):
+        for entry in source["models"]:
+            if isinstance(entry, dict) and entry.get("slug"):
+                entries.setdefault(str(entry["slug"]), entry)
+    merged = dict(bundled)
+    merged["models"] = list(entries.values())
+    return merged, f"Codex CLI 内置目录 + {local_path}"
+
+
+def is_deepseek_provider(name: str, provider: dict[str, Any]) -> bool:
+    return any("deepseek" in str(value or "").lower() for value in (name, provider.get("model"), provider.get("base_url")))
+
+
+def write_combined_model_catalog(state: dict[str, Any], native: dict[str, Any] | None) -> tuple[Path | None, Path | None]:
+    """Keep Codex-native models and all configured custom-provider models in one stable catalog."""
+    custom_providers = [
+        (name, provider)
+        for name, provider in state["providers"].items()
+        if provider.get("model_catalog_json") or is_deepseek_provider(name, provider)
+    ]
+    if native is None or not custom_providers:
+        return None, None
+
+    native_path = native_model_catalog_path(state)
+    target = combined_model_catalog_path(state)
+    source_paths = [native_path]
+    source_paths.extend(expand_path(provider.get("model_catalog_json")) for _, provider in custom_providers)
+    if any(path is not None and path.resolve() == target.resolve() for path in source_paths):
+        raise SystemExit(f"联合模型目录不能覆盖源目录: {target}")
+
+    combined = dict(native)
+    entries: dict[str, dict[str, Any]] = {}
+
+    def merge(catalog: dict[str, Any]) -> None:
+        for entry in catalog.get("models", []):
+            if isinstance(entry, dict) and entry.get("slug"):
+                entries[str(entry["slug"])] = entry
+
+    merge(native)
+    for name, provider in custom_providers:
+        if is_deepseek_provider(name, provider):
+            # Keep built-in DeepSeek metadata in the union even before its source file exists.
+            merge(json.loads(models_catalog_json()))
+        path = expand_path(provider.get("model_catalog_json"))
+        catalog = read_model_catalog(path) if path and path.resolve() != native_path.resolve() else None
+        if catalog is not None:
+            merge(catalog)
+
+    combined["models"] = list(entries.values())
+    rendered = json.dumps(combined, ensure_ascii=False, indent=2) + "\n"
+    if target.exists() and read_text(target) == rendered:
+        return target, None
+    target.parent.mkdir(parents=True, exist_ok=True)
+    backup_path = backup(target) if target.exists() else None
+    temporary = target.with_name(f".{target.name}.tmp")
+    temporary.write_text(rendered, encoding="utf-8")
+    temporary.replace(target)
+    return target, backup_path
+
+
+def activate(state: dict[str, Any], name: str, model_override: str | None = None, effort_override: str | None = None, write_key: bool = True) -> dict[str, Any]:
+    with launcher.channel_lock(state["config"]):
+        return activate_locked(state, name, model_override, effort_override, write_key)
+
+
+def activate_locked(state: dict[str, Any], name: str, model_override: str | None = None, effort_override: str | None = None, write_key: bool = True) -> dict[str, Any]:
+    provider = provider_with_token(state, provider_or_exit(state, name), write_key)
+    current = parse_codex_top(state["config"])
+    model = str(model_override or provider.get("model") or current.get("model") or "gpt-5.5")
+    effort = effort_override or provider.get("reasoning_effort") or current.get("model_reasoning_effort")
+    codex_name = codex_provider_name(name)
+    native, _ = native_model_catalog(state)
+    models_backup = None
+    catalog = expand_path(provider.get("model_catalog_json"))
+    deepseek_provider = is_deepseek_provider(name, provider)
+    combined_enabled = native is not None and any(
+        item.get("model_catalog_json") or is_deepseek_provider(provider_name, item)
+        for provider_name, item in state["providers"].items()
+    )
+    combined_target = combined_model_catalog_path(state)
+    if combined_enabled and catalog and catalog.resolve() == combined_target.resolve():
+        raise SystemExit(f"联合模型目录不能同时作为源目录: {combined_target}")
+    if catalog and not deepseek_provider and read_model_catalog(catalog) is None:
+        raise SystemExit(f"provider 模型目录不存在或格式无效: {catalog}")
+    if catalog and deepseek_provider and catalog.resolve() != native_model_catalog_path(state).resolve():
+        models_backup = write_models_json(catalog, model)
+    combined_catalog, combined_backup = write_combined_model_catalog(state, native)
+    config_provider = dict(provider)
+    if combined_catalog:
+        config_provider["model_catalog_json"] = str(combined_catalog)
+    config_backup = write_codex_config(state, config_provider, model, str(effort) if effort else None, codex_name)
     auth = auth_path(state)
     key = token_for(provider, auth)
     auth_backup = write_auth(auth, str(key)) if key and write_key else None
-    # 渠道声明了 model_catalog_json 时，把内置的模型目录写入对应路径
-    models_backup = None
-    catalog = provider.get("model_catalog_json")
-    if catalog:
-        models_backup = write_models_json(expand_path(catalog), model)
-    return {"provider": provider, "model": model, "effort": effort, "config_backup": config_backup, "auth_backup": auth_backup, "models_backup": models_backup, "state": write_active_provider(state, name)}
+    # 渠道切换共用固定联合目录；只有目录本身变化时才需刷新 daemon。
+    signature = catalog_signature(config_provider)
+    loaded_signature = active_catalog(state)
+    catalog_changed = signature != loaded_signature
+    state_path = write_active_provider(state, name, loaded_signature)
+    return {"provider": provider, "model": model, "effort": effort, "codex_provider": codex_name, "catalog_changed": catalog_changed, "catalog_signature": signature, "config_backup": config_backup, "auth_backup": auth_backup, "models_backup": models_backup or combined_backup, "state": state_path}
+
+
+def running_daemon_pid(state: dict[str, Any]) -> int | None:
+    """读 <codex_home>/app-server-daemon/daemon.pid，拿常驻 daemon 的 pid。"""
+    path = state["config"].parent / DAEMON_PID_DIR / DAEMON_PID_NAME
+    try:
+        return int(json.loads(read_text(path))["pid"])
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def refresh_codex_daemon(state: dict[str, Any], command: str = CODEX_COMMAND) -> tuple[str, bool]:
+    """重启常驻 Codex daemon，返回一行状态说明。
+
+    daemon 只在启动那一刻读一遍模型目录并把内容缓存进内存，之后即使配置文件变了也不重读
+    —— 所以首次加载联合目录或目录源变化时，需要 daemon 重启来刷新列表。使用 Codex 自带的
+    restart 命令，让正在执行的 turn 排空后再重启；等待超时也不会强制结束 daemon。
+    """
+    pid = running_daemon_pid(state)
+    if pid is None:
+        return "未检测到运行中的 Codex daemon，跳过重启", True
+    try:
+        completed = subprocess.run([command, "app-server", "daemon", "restart"], capture_output=True, stdin=subprocess.DEVNULL, encoding="utf-8", timeout=120, check=False)
+    except subprocess.TimeoutExpired:
+        return "等待 Codex daemon 优雅重启超过 120 秒；没有强制中断任务。任务结束后可再次执行 `codex app-server daemon restart` 刷新模型列表", False
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"模型目录已变，但 Codex daemon 重启失败，请手动执行 `codex app-server daemon restart`（{error}）", False
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip().splitlines()
+        return f"模型目录已变，但 Codex daemon 重启失败，请手动执行 `codex app-server daemon restart`（{detail[-1] if detail else completed.returncode}）", False
+    return "模型目录已变，Codex daemon 已优雅重启，模型列表已刷新", True
+
+
+def defer_catalog_refresh_after_activation(state: dict[str, Any], result: dict[str, Any], provider: str) -> str | None:
+    if not result["catalog_changed"]:
+        return None
+    if running_daemon_pid(state) is None:
+        write_active_provider(state, provider, result["catalog_signature"])
+        return "模型目录已更新；当前没有运行中的 Codex daemon，新启动的 daemon 会读取新列表"
+    return "模型目录已更新；当前 daemon 仍缓存旧列表。需要刷新时执行 `cxto models --refresh`，它会等待正在进行的任务完成"
 
 
 def session_provider(state: dict[str, Any], session_id: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", session_id):
+        raise SystemExit("请提供完整的 Codex 会话 UUID")
     candidates = sorted(sessions_path(state).rglob(f"*{session_id}*.jsonl"))
     for path in candidates:
         try:
-            for line in read_text(path).splitlines():
-                record = json.loads(line)
-                payload = record.get("payload", {})
-                if record.get("type") == "session_meta" and str(payload.get("session_id") or payload.get("id") or "") == session_id and payload.get("model_provider"):
-                    return str(payload["model_provider"])
-        except (OSError, json.JSONDecodeError):
+            with path.open(encoding="utf-8") as stream:
+                for line in stream:
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(record, dict) or record.get("type") != "session_meta":
+                        continue
+                    payload = record.get("payload", {})
+                    if isinstance(payload, dict) and str(payload.get("session_id") or payload.get("id") or "").lower() == session_id and payload.get("model_provider"):
+                        return str(payload["model_provider"])
+        except OSError:
             continue
     raise SystemExit(f"未找到会话 {session_id} 的 session_meta 或 model_provider")
 
@@ -589,15 +875,31 @@ def config_key(name: str) -> str:
     return name if re.fullmatch(r"[A-Za-z0-9_]+", name) else quote_toml(name)
 
 
-def resume_arguments(old_provider: str, target: dict[str, Any], session_id: str) -> list[str]:
+def resume_arguments(old_provider: str, target: dict[str, Any] | None, session_id: str) -> list[str]:
+    # Codex 恢复时先校验 provider 身份；仅覆盖块里的 URL 不能通过该校验。
+    command = ["codex", "resume", "-c", f"model_provider={quote_toml(old_provider)}"]
+    if target is None:
+        return command + [session_id]
     base_url = str(target.get("base_url", "")).strip()
     if not base_url:
         raise SystemExit("目标provider缺少base_url")
-    prefix = f"model_providers.{config_key(old_provider)}"
-    command = ["codex", "resume", "-c", f"{prefix}.base_url={quote_toml(base_url)}"]
-    for key in ("wire_api", "requires_openai_auth"):
-        if key in target:
-            command.extend(["-c", f"{prefix}.{key}={quote_toml(target[key])}"])
+    # 配置层会合并 inline table，必须显式重置目标渠道未设置的旧认证字段。
+    values = {"name": old_provider, "base_url": base_url, "wire_api": target.get("wire_api", "responses"),
+              "requires_openai_auth": target.get("requires_openai_auth", False),
+              "experimental_bearer_token": target.get("experimental_bearer_token", "")}
+    # env_key 不能设为空字符串（Codex 会要求名为空的环境变量）。独立 token 使用
+    # 本进程专用环境变量；即使旧块有 env_key，也不会再读到别的渠道凭证。
+    if target.get("experimental_bearer_token"):
+        values["env_key"] = RESUME_TOKEN_ENV
+    elif target.get("env_key"):
+        values["env_key"] = target["env_key"]
+    block = "{ " + ", ".join(f"{key} = {quote_toml(value)}" for key, value in values.items()) + " }"
+    if re.fullmatch(r"[A-Za-z0-9_]+", old_provider):
+        override = f"model_providers.{old_provider}={block}"
+    else:
+        # CLI 按点拆分 -c 路径，不识别 TOML 引号；特殊名字须作为表内的键传入。
+        override = f"model_providers={{ {quote_toml(old_provider)} = {block} }}"
+    command.extend(["-c", override])
     return command + [session_id]
 
 
@@ -612,8 +914,9 @@ def command_status(args: argparse.Namespace) -> None:
     provider = state["providers"].get(name, {})
     current = parse_codex_top(state["config"])
     print(f"当前渠道: {name or '-'}")
-    if current.get("model_provider") == ACTIVE_PROVIDER:
-        print(f"Codex会话Provider身份: {ACTIVE_PROVIDER}")
+    configured = current.get("model_provider")
+    if configured and (channel_from_codex_provider(configured) or configured == ACTIVE_PROVIDER):
+        print(f"Codex会话Provider身份: {configured}")
     print(f"Base URL: {provider.get('base_url', '-')}")
     print(f"模型: {current.get('model', provider.get('model', '-'))}")
     print(f"Token: {masked(token_for(provider, auth_path(state)))}")
@@ -631,26 +934,69 @@ def command_use(args: argparse.Namespace) -> None:
     state = load_state(args)
     result = activate(state, args.provider, args.model, args.effort, not args.no_auth)
     print(f"已切换到渠道: {args.provider}")
-    print(f"Codex会话Provider身份: {ACTIVE_PROVIDER}")
+    print(f"Codex会话Provider身份: {result['codex_provider']}")
     print(f"配置备份: {result['config_backup']}")
     if result["auth_backup"]:
         print(f"认证备份: {result['auth_backup']}")
+    entry = shutil.which("codex")
+    if not entry or not launcher._is_wrapper(Path(entry)):
+        print("多窗口隔离：先运行 cxto install-launcher，或使用 cxto run 启动新会话")
+    # 渠道切换始终保持即时；模型目录缓存通过显式的 models --refresh 更新。
+    message = defer_catalog_refresh_after_activation(state, result, args.provider)
+    if message:
+        print(message)
 
 
 def command_resume(args: argparse.Namespace) -> None:
     state = load_state(args)
-    target = provider_or_exit(state, args.provider)
-    old = session_provider(state, args.session_id)
-    command = resume_arguments(old, target, args.session_id)
+    session_id = (args.session_id or args.provider).lower()
+    old = session_provider(state, session_id)
+    explicit_channel = args.provider if args.session_id else None
+    target = None
+    if explicit_channel:
+        target = provider_with_token(state, provider_or_exit(state, explicit_channel))
+        if not target.get("experimental_bearer_token"):
+            env_key = target.get("env_key")
+            token = None
+            if env_key:
+                token = os.environ.get(str(env_key))
+            elif target.get("requires_openai_auth"):
+                token = token_for(target, auth_path(state))
+            if env_key and not token:
+                raise SystemExit(f"目标渠道所需的环境变量未设置: {env_key}")
+            if token:
+                target["experimental_bearer_token"] = token
+        existing = parse_codex_providers(state["config"]).get(old, {})
+        if existing.get("env_key") and not target.get("experimental_bearer_token") and not target.get("env_key"):
+            raise SystemExit("旧会话使用环境变量认证；请先为目标渠道配置 auth_token_path 或 env_key 再恢复")
+    elif old == ACTIVE_PROVIDER or (old != "openai" and old not in parse_codex_providers(state["config"])):
+        reason = "旧会话使用共享 provider，无法确定原渠道" if old == ACTIVE_PROVIDER else f"缺少原 provider 配置: {old}"
+        raise SystemExit(f"{reason}；请使用 cxto resume <渠道> {session_id} 显式选择目标渠道")
+    command = resume_arguments(old, target, session_id)
     if args.dry_run:
         print(f"旧会话Provider身份: {old}")
-        print(f"目标渠道: {args.provider}")
+        print(f"目标渠道: {explicit_channel or channel_from_codex_provider(old) or old}")
         print("dry-run：不会修改配置、不会写入密钥、不会启动Codex。")
-        print(shlex.join(command))
+        preview = dict(target) if target is not None else None
+        if preview is not None and "experimental_bearer_token" in preview:
+            preview["experimental_bearer_token"] = "<redacted>"
+        preview_command = resume_arguments(old, preview, session_id)
+        if preview is not None and preview.get("experimental_bearer_token"):
+            preview_command = ["env", f"{RESUME_TOKEN_ENV}=<redacted>"] + preview_command
+        print(shlex.join(preview_command))
         return
-    activate(state, args.provider)
-    print(f"旧会话Provider身份: {old}；正在恢复到渠道: {args.provider}", flush=True)
-    os.execvp(command[0], command)
+    if explicit_channel:
+        result = activate(state, explicit_channel)
+        print(f"旧会话Provider身份: {old}；正在恢复到渠道: {explicit_channel}", flush=True)
+        message = defer_catalog_refresh_after_activation(state, result, explicit_channel)
+        if message:
+            print(message, flush=True)
+    else:
+        print(f"沿用会话Provider身份: {old}；全局默认渠道不变", flush=True)
+    if target is not None and target.get("experimental_bearer_token"):
+        os.execvpe(command[0], command, os.environ | {RESUME_TOKEN_ENV: str(target["experimental_bearer_token"])})
+    else:
+        os.execvp(command[0], command)
 
 
 def command_export_env(args: argparse.Namespace) -> None:
@@ -664,7 +1010,7 @@ def command_export_env(args: argparse.Namespace) -> None:
         "OPENAI_BASE_URL": str(provider.get("base_url", "")),
         "OPENAI_API_KEY": token_for(provider, auth_path(state)) or "",
         "OPENAI_MODEL": str(provider.get("model") or current.get("model") or "gpt-5.5"),
-        "CODEX_MODEL_PROVIDER": ACTIVE_PROVIDER,
+        "CODEX_MODEL_PROVIDER": codex_provider_name(name),
     }
     if args.format == "shell":
         for key, value in values.items():
@@ -676,9 +1022,33 @@ def command_export_env(args: argparse.Namespace) -> None:
 
 def command_models(args: argparse.Namespace) -> None:
     state = load_state(args)
-    catalog = expand_path(state["top"].get("model_catalog_path")) or home() / ".codex" / "model_catalog.json"
-    if not catalog.exists():
-        raise SystemExit(f"模型目录不存在: {catalog}")
+    if args.refresh:
+        native, native_source = native_model_catalog(state)
+        if native is not None:
+            combined, _ = write_combined_model_catalog(state, native)
+            if combined:
+                backup_path = write_model_catalog_config(state, combined)
+                if backup_path:
+                    print(f"配置备份: {backup_path}")
+            print(f"原生模型目录来源: {native_source}")
+        configured = parse_codex_top(state["config"]).get("model_catalog_json")
+        catalog = expand_path(configured) or expand_path(state["top"].get("model_catalog_path")) or home() / ".codex" / "model_catalog.json"
+        if not catalog.exists() or read_model_catalog(catalog) is None:
+            raise SystemExit(f"模型目录不存在或格式无效: {catalog}")
+        signature = catalog_signature({"model_catalog_json": str(catalog)})
+        if signature != active_catalog(state):
+            message, loaded = refresh_codex_daemon(state)
+            if loaded:
+                write_active_provider(state, active_provider(state) or resolved_current_provider(state) or "", signature)
+            print(message)
+        else:
+            print("模型列表已是最新，无需刷新")
+    configured = parse_codex_top(state["config"]).get("model_catalog_json")
+    catalog = expand_path(configured) or expand_path(state["top"].get("model_catalog_path")) or home() / ".codex" / "model_catalog.json"
+    if not catalog.exists() or read_model_catalog(catalog) is None:
+        raise SystemExit(f"模型目录不存在或格式无效: {catalog}")
+    if not args.refresh and catalog_signature({"model_catalog_json": str(catalog)}) != active_catalog(state) and running_daemon_pid(state) is not None:
+        print("提示：daemon 中的模型列表可能较旧；执行 `cxto models --refresh` 刷新", file=sys.stderr)
     needle = (args.filter or "").lower()
     for item in json.loads(read_text(catalog)).get("models", []):
         slug = str(item.get("slug", ""))
@@ -717,36 +1087,171 @@ def command_init(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="cxto", description="可移植的 Codex 渠道与会话切换工具")
-    parser.add_argument("--config", help="指定 YAML 配置；也可通过 CXTO_CONFIG 指定")
-    parser.add_argument("-p", "--profile", help="读取 ~/.cxto.<profile>.yaml")
+    root_help = """命令速查:
+  cxto providers
+      列出配置中的渠道，并标记当前渠道。
+  cxto status
+      查看当前渠道、模型、Base URL 和脱敏后的 API key。
+  cxto use <渠道> [模型] [--effort low|medium|high|xhigh] [--no-auth] [--no-restart]
+      切换之后新开的 Codex 会话使用的渠道；不重启 daemon。
+      --effort 覆盖推理强度；--no-auth 不写入 ~/.codex/auth.json。
+      --no-restart 是旧版兼容参数；模型列表刷新请用 cxto models --refresh。
+  cxto install-launcher [--path Codex入口] [--dry-run]
+      为普通 codex 命令安装可回滚的进程隔离启动器；只需安装一次。
+  cxto uninstall-launcher [--path Codex入口] [--dry-run]
+      恢复安装前的 Codex 入口。
+  cxto run [--codex 原Codex入口] -- [Codex参数]
+      捕获当前渠道并启动独立进程，后续切换不影响该进程。
+  cxto resume [渠道] <会话ID> [--dry-run] [--no-restart]
+      省略渠道时沿用会话原 provider，不改变全局默认渠道。
+      指定渠道时先切换默认渠道，再为恢复进程注入目标路由和会话原 provider 身份。
+      --dry-run 只打印恢复命令，不改配置、不写 key、不启动 Codex。
+      --no-restart 是旧版兼容参数；模型列表刷新请用 cxto models --refresh。
+  cxto models [筛选词] [--refresh]
+      查看模型目录；可以按模型 slug 或显示名称筛选。
+      --refresh 使用当前 Codex CLI 内置目录及渠道模型源重建联合目录；有变化才刷新 daemon。
+  cxto export-env [--provider 渠道] [--format shell|docker] [--mask]
+      导出渠道环境变量；--mask 隐藏 API key，--format 选择 shell 或 Docker 格式。
+  cxto init [--print] [-o 路径] [--force]
+      生成配置模板；默认写入 ~/.config/cxto/config.yaml。
+
+常见示例:
+  cxto providers
+  cxto use deepseek
+  cxto use channel_a gpt-5.5 --effort xhigh
+  cxto models gpt
+  cxto models --refresh
+  cxto resume <会话ID>
+  cxto resume channel_a <会话ID> --dry-run
+  cxto export-env --provider channel_a --format docker --mask
+  cxto init --print
+
+模型列表说明:
+  cxto use 会即时切换渠道并更新磁盘上的联合目录，不会等待刷新。
+  daemon 会缓存模型列表；模型目录有更新时运行 cxto models --refresh。
+  只有显式刷新会等待正在进行的任务完成，最多 120 秒，超时不会强制中断任务。
+  官方模型目录取自已安装 Codex CLI；要获得 CLI 新版本附带的模型，先运行 codex update。
+  配置中的 model_catalog_path 是本机补充目录，会与 CLI 内置目录合并；同名时使用 CLI 元数据。
+
+配置选择:
+  默认合并 ~/.cxto.team.yaml、~/.cxto.local.yaml 和 ~/.config/cxto/config.yaml。
+  --config 指定单个配置文件；-p NAME 读取 ~/.cxto.NAME.yaml。
+  --config 与 --profile 同时出现时，以 --config 为准。"""
+    parser = argparse.ArgumentParser(
+        prog="cxto",
+        description="管理 Codex 渠道、模型目录和已有会话。运行 cxto <命令> -h 查看单条命令的参数说明。",
+        epilog=root_help,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--config", help="指定单个 YAML 配置文件；优先级高于 --profile 和默认配置")
+    parser.add_argument("-p", "--profile", metavar="NAME", help="读取 ~/.cxto.NAME.yaml；也可传入配置文件路径")
     parser.add_argument("--version", action="version", version=f"cxto {VERSION}")
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("status", help="查看当前渠道").set_defaults(func=command_status)
-    commands.add_parser("providers", help="列出可用渠道").set_defaults(func=command_providers)
-    use = commands.add_parser("use", help="切换渠道；新会话可安全恢复并再次切换")
-    use.add_argument("provider")
-    use.add_argument("model", nargs="?")
-    use.add_argument("--effort", choices=["low", "medium", "high", "xhigh"])
-    use.add_argument("--no-auth", action="store_true", help="不写 ~/.codex/auth.json")
+
+    def add_command(name: str, summary: str, description: str, epilog: str) -> argparse.ArgumentParser:
+        return commands.add_parser(
+            name,
+            help=summary,
+            description=description,
+            epilog=epilog,
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+
+    providers = add_command(
+        "providers",
+        "列出可用渠道",
+        "列出配置文件中的所有渠道。当前渠道前会显示 *，并显示默认模型和 Base URL。",
+        "示例:\n  cxto providers",
+    )
+    providers.set_defaults(func=command_providers)
+
+    status = add_command(
+        "status",
+        "查看当前渠道状态",
+        "显示当前渠道、模型、Base URL 和脱敏后的 API key。",
+        "示例:\n  cxto status",
+    )
+    status.set_defaults(func=command_status)
+
+    run = add_command(
+        "run", "以启动时渠道固定的配置运行 Codex",
+        "为当前渠道捕获进程专属的 provider、URL、凭证、模型和推理强度。\n"
+        "后续 cxto use 不改变该进程。Codex 参数放在 -- 后面。",
+        "示例:\n  cxto run\n  cxto run -- --no-alt-screen\n  cxto run -- resume <会话ID>",
+    )
+    run.add_argument("--codex", help="真实 Codex 入口；默认从 PATH 解析（自动绕过已安装的 cxto 启动器）")
+    run.add_argument("codex_arguments", nargs=argparse.REMAINDER, help="-- 后面的所有参数原样交给 Codex")
+    run.set_defaults(func=launcher.command_run)
+    for name, handler, summary in (
+        ("install-launcher", launcher.command_install, "为普通 codex 命令安装进程隔离启动器"),
+        ("uninstall-launcher", launcher.command_uninstall, "恢复安装前的 Codex 入口"),
+    ):
+        command = add_command(name, summary, summary + "；保留原文件或符号链接以便恢复。", f"示例:\n  cxto {name}\n  cxto {name} --dry-run")
+        command.add_argument("--path", help="Codex 入口路径；默认使用 PATH 中的 codex")
+        command.add_argument("--dry-run", action="store_true", help="仅展示操作，不修改文件")
+        command.set_defaults(func=handler)
+
+    use = add_command(
+        "use",
+        "即时切换当前渠道和模型",
+        "更新 Codex 的当前渠道、模型和认证配置。切换只影响新开的会话；\n"
+        "已经运行的会话继续使用创建时绑定的渠道。切换不会重启 daemon。",
+        "示例:\n  cxto use channel_a\n  cxto use channel_a gpt-5.5 --effort xhigh",
+    )
+    use.add_argument("provider", metavar="渠道", help="配置中的渠道名称；运行 cxto providers 查看")
+    use.add_argument("model", nargs="?", metavar="模型", help="可选，覆盖渠道默认模型")
+    use.add_argument("--effort", choices=["low", "medium", "high", "xhigh"], help="覆盖渠道默认推理强度")
+    use.add_argument("--no-auth", action="store_true", help="不写入 ~/.codex/auth.json")
+    use.add_argument("--no-restart", action="store_true", help="旧版兼容参数；模型目录刷新请显式运行 cxto models --refresh")
     use.set_defaults(func=command_use)
-    resume = commands.add_parser("resume", help="切换渠道并兼容恢复旧会话")
-    resume.add_argument("provider")
-    resume.add_argument("session_id")
-    resume.add_argument("--dry-run", action="store_true")
+
+    resume = add_command(
+        "resume",
+        "自动沿用原渠道或指定渠道恢复会话",
+        "只传会话 ID 时，沿用会话原 provider，不写全局配置、认证或渠道状态。\n"
+        "传入渠道和会话 ID 时，先切换默认渠道，再为本次恢复覆盖路由与凭证。\n"
+        "两种方式都会选择会话原 provider 身份，以满足 Codex 的恢复校验。",
+        "示例:\n  cxto resume <会话ID>\n  cxto resume channel_a <会话ID> --dry-run\n  cxto resume channel_a <会话ID>",
+    )
+    resume.add_argument("provider", metavar="渠道或会话ID", help="会话 UUID；或目标渠道名（随后再传会话 UUID）")
+    resume.add_argument("session_id", nargs="?", metavar="会话ID", help="显式选择渠道时的 Codex 会话 UUID")
+    resume.add_argument("--dry-run", action="store_true", help="预览恢复命令并隐藏密钥，不改配置、不写 key、不启动 Codex")
+    resume.add_argument("--no-restart", action="store_true", help="旧版兼容参数；模型目录刷新请显式运行 cxto models --refresh")
     resume.set_defaults(func=command_resume)
-    export = commands.add_parser("export-env", help="输出当前渠道的环境变量")
-    export.add_argument("--provider")
-    export.add_argument("--format", choices=["shell", "docker"], default="shell")
-    export.add_argument("--mask", action="store_true")
+
+    export = add_command(
+        "export-env",
+        "导出渠道环境变量",
+        "输出 OPENAI_BASE_URL、OPENAI_API_KEY、OPENAI_MODEL 和 CODEX_MODEL_PROVIDER。",
+        "示例:\n  eval \"$(cxto export-env --provider channel_a)\"\n  cxto export-env --provider channel_a --format docker --mask",
+    )
+    export.add_argument("--provider", metavar="渠道", help="要导出的渠道；默认使用当前渠道")
+    export.add_argument("--format", choices=["shell", "docker"], default="shell", help="shell 输出 export 语句；docker 输出 -e 参数")
+    export.add_argument("--mask", action="store_true", help="隐藏 API key；用于检查输出时避免显示密钥")
     export.set_defaults(func=command_export_env)
-    models = commands.add_parser("models", help="列出 Codex 本地模型目录")
-    models.add_argument("filter", nargs="?")
+
+    models = add_command(
+        "models",
+        "查看或刷新模型目录",
+        "默认列出当前配置指向的模型目录。筛选词会匹配模型 slug 或 display_name。",
+        "示例:\n  cxto models\n  cxto models gpt\n  cxto models --refresh\n\n"
+        "--refresh 会从已安装 Codex CLI 读取内置目录，并合并 model_catalog_path 本机补充目录与渠道目录；\n"
+        "要获得较新官方模型，先运行 codex update。仅在目录变化时请求优雅重启 daemon。\n"
+        "正在运行的任务会先完成，最多等待 120 秒，不会被强制中断。",
+    )
+    models.add_argument("filter", nargs="?", metavar="筛选词", help="按模型 slug 或显示名称筛选")
+    models.add_argument("--refresh", action="store_true", help="读取当前 CLI 内置目录、合并渠道源并刷新 daemon；可能等待正在运行的任务完成")
     models.set_defaults(func=command_models)
-    init = commands.add_parser("init", help="根据当前渠道生成可移植配置模板")
-    init.add_argument("--print", action="store_true", help="只打印，不写文件")
-    init.add_argument("-o", "--output", help="输出配置路径")
-    init.add_argument("--force", action="store_true", help="覆盖已有配置")
+
+    init = add_command(
+        "init",
+        "生成 cxto 配置模板",
+        "根据当前已知渠道生成可移植的 YAML 配置模板。模板不含真实 API key。",
+        "示例:\n  cxto init --print\n  cxto init -o ~/.config/cxto/config.yaml\n  cxto init --force",
+    )
+    init.add_argument("--print", action="store_true", help="打印模板到终端，不写入文件")
+    init.add_argument("-o", "--output", metavar="路径", help="指定写入位置；默认 ~/.config/cxto/config.yaml")
+    init.add_argument("--force", action="store_true", help="覆盖已存在的目标文件")
     init.set_defaults(func=command_init)
     return parser
 
